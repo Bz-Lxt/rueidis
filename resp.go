@@ -185,6 +185,10 @@ func readI(i *bufio.Reader) (v int64, err error) {
 	if len(bs) < 3 {
 		return 0, errors.New(unexpectedNoCRLF)
 	}
+	return parseIntLine(bs)
+}
+
+func parseIntLine(bs []byte) (v int64, err error) {
 	if bs[0] == '?' {
 		return 0, errChunked
 	}
@@ -302,6 +306,355 @@ func readNextMessage(i *bufio.Reader) (m RedisMessage, err error) {
 		m.attrs = attrs
 		return m, nil
 	}
+}
+
+// readLimit configures the per-message safety limits. A zero value disables all limits.
+type readLimit struct {
+	maxBytes int64 // maximum accumulated wire bytes of a single message
+	maxElems int64 // maximum accumulated element count of a single message
+	maxDepth int   // maximum nesting depth of a single message
+}
+
+func (l readLimit) enabled() bool {
+	return l.maxBytes > 0 || l.maxElems > 0 || l.maxDepth > 0
+}
+
+// limitedReader reads a RESP message while enforcing byte, element and nesting-depth limits.
+// Once any limit is exceeded, limitedReader enters a sticky discarding mode: it keeps walking
+// and draining the rest of the current message so the connection stays usable for the following
+// replies, but it stops allocating payloads for the message that exceeded the limit.
+type limitedReader struct {
+	i        *bufio.Reader
+	l        readLimit
+	bytes    int64
+	elems    int64
+	depth    int
+	exceeded error
+}
+
+func (lr *limitedReader) reset(i *bufio.Reader, l readLimit) {
+	lr.i = i
+	lr.l = l
+	lr.bytes = 0
+	lr.elems = 0
+	lr.depth = 0
+	lr.exceeded = nil
+}
+
+func (lr *limitedReader) addBytes(n int64) {
+	if lr.exceeded != nil {
+		return
+	}
+	lr.bytes += n
+	if lr.l.maxBytes > 0 && lr.bytes > lr.l.maxBytes {
+		lr.exceeded = ErrMessageSizeExceeded
+	}
+}
+
+func (lr *limitedReader) addElements(n int64) {
+	if lr.exceeded != nil {
+		return
+	}
+	lr.elems += n
+	if lr.l.maxElems > 0 && lr.elems > lr.l.maxElems {
+		lr.exceeded = ErrMessageElementsExceeded
+	}
+}
+
+// reserveElements checks whether n more elements can fit without adding them.
+// Aggregate children count themselves when they are read, but the reservation
+// is done before allocating the aggregate backing slice so that a huge declared
+// length cannot exhaust the memory.
+func (lr *limitedReader) reserveElements(n int64) {
+	if lr.exceeded != nil {
+		return
+	}
+	if lr.l.maxElems > 0 && lr.elems+n > lr.l.maxElems {
+		lr.exceeded = ErrMessageElementsExceeded
+	}
+}
+
+func (lr *limitedReader) enterDepth() {
+	if lr.exceeded != nil {
+		return
+	}
+	lr.depth++
+	if lr.l.maxDepth > 0 && lr.depth > lr.l.maxDepth {
+		lr.exceeded = ErrMessageDepthExceeded
+	}
+}
+
+func (lr *limitedReader) leaveDepth() { lr.depth-- }
+
+func (lr *limitedReader) discard(n int64) error {
+	_, err := lr.i.Discard(int(n))
+	return err
+}
+
+// readNext reads one complete message tree. The returned message keeps its type
+// even when a limit is exceeded, which lets callers distinguish pushes from command replies.
+func (lr *limitedReader) readNext() (m RedisMessage, err error) {
+	var attrs *RedisMessage
+	for {
+		var typ byte
+		if typ, err = lr.i.ReadByte(); err != nil {
+			return RedisMessage{}, err
+		}
+		if typ != typeEnd { // the chunked end marker is not a delivered element
+			lr.addElements(1)
+		}
+
+		switch typ {
+		case typeBlobString, typeBlobErr, typeVerbatimString:
+			m, err = lr.readBlob()
+		case typeSimpleString, typeSimpleErr, typeFloat, typeBigNumber:
+			m, err = lr.readSimple()
+		case typeInteger:
+			m, err = lr.readInteger()
+		case typeNull, typeEnd:
+			lr.addBytes(2)
+			err = lr.discard(2)
+		case typeBool:
+			m, err = lr.readBool()
+		case typeArray, typeSet, typePush:
+			m, err = lr.readArray()
+		case typeMap, typeAttribute:
+			m, err = lr.readMap()
+		default:
+			return RedisMessage{}, errors.New(unknownMessageType + strconv.Itoa(int(typ)))
+		}
+		if err != nil {
+			if err == errOldNull {
+				return RedisMessage{typ: typeNull}, lr.exceeded
+			}
+			return RedisMessage{typ: typ}, err
+		}
+		m.typ = typ
+		if typ == typeAttribute { // handle the attributes, even in discarding mode
+			a := m
+			attrs = &a
+			m = RedisMessage{}
+			continue
+		}
+		if lr.exceeded != nil {
+			return RedisMessage{typ: typ}, lr.exceeded
+		}
+		m.attrs = attrs
+		return m, nil
+	}
+}
+
+func (lr *limitedReader) readSimple() (m RedisMessage, err error) {
+	bs, err := lr.i.ReadBytes('\n')
+	if err != nil {
+		return RedisMessage{}, err
+	}
+	lr.addBytes(int64(len(bs)))
+	if len(bs) < 2 {
+		return RedisMessage{}, errors.New(unexpectedNoCRLF)
+	}
+	if lr.exceeded != nil {
+		return RedisMessage{}, lr.exceeded
+	}
+	trim := len(bs) - 2
+	m.bytes = unsafe.SliceData(bs[:trim])
+	m.intlen = int64(trim)
+	return m, nil
+}
+
+func (lr *limitedReader) readInteger() (m RedisMessage, err error) {
+	m.intlen, err = lr.readI()
+	return m, err
+}
+
+func (lr *limitedReader) readI() (v int64, err error) {
+	bs, err := lr.i.ReadSlice('\n')
+	if err != nil {
+		return 0, err
+	}
+	lr.addBytes(int64(len(bs)))
+	return parseIntLine(bs)
+}
+
+func (lr *limitedReader) readBool() (m RedisMessage, err error) {
+	b, err := lr.i.ReadByte()
+	if err != nil {
+		return RedisMessage{}, err
+	}
+	lr.addBytes(4)
+	if _, err = lr.i.Discard(2); err != nil {
+		return RedisMessage{}, err
+	}
+	if b == 't' {
+		m.intlen = 1
+	}
+	if lr.exceeded != nil {
+		return RedisMessage{}, lr.exceeded
+	}
+	return m, nil
+}
+
+func (lr *limitedReader) readBlob() (m RedisMessage, err error) {
+	length, err := lr.readI()
+	if err != nil {
+		if err == errChunked {
+			return lr.readChunkedBlob()
+		}
+		return RedisMessage{}, err
+	}
+	if length == -1 {
+		return m, errOldNull
+	}
+	lr.addBytes(length + 2)
+	if lr.exceeded != nil {
+		if err = lr.discard(length + 2); err != nil {
+			return RedisMessage{}, err
+		}
+		return RedisMessage{}, lr.exceeded
+	}
+	bs := make([]byte, length)
+	if _, err = io.ReadFull(lr.i, bs); err != nil {
+		return RedisMessage{}, err
+	}
+	if _, err = lr.i.Discard(2); err != nil {
+		return RedisMessage{}, err
+	}
+	m.bytes = unsafe.SliceData(bs)
+	m.intlen = length
+	return m, nil
+}
+
+func (lr *limitedReader) readChunkedBlob() (m RedisMessage, err error) {
+	var sb strings.Builder
+	for {
+		if _, err = lr.i.Discard(1); err != nil { // discard the ';'
+			return RedisMessage{}, err
+		}
+		var length int64
+		if length, err = lr.readI(); err != nil {
+			return RedisMessage{}, err
+		}
+		if length == 0 {
+			if lr.exceeded != nil {
+				return RedisMessage{}, lr.exceeded
+			}
+			m.setString(sb.String())
+			return m, nil
+		}
+		lr.addBytes(length + 2)
+		if lr.exceeded != nil {
+			if err = lr.discard(length + 2); err != nil {
+				return RedisMessage{}, err
+			}
+			continue
+		}
+		sb.Grow(int(length))
+		if _, err = io.CopyN(&sb, lr.i, length); err != nil {
+			return RedisMessage{}, err
+		}
+		if _, err = lr.i.Discard(2); err != nil {
+			return RedisMessage{}, err
+		}
+	}
+}
+
+func (lr *limitedReader) readArray() (m RedisMessage, err error) {
+	length, err := lr.readI()
+	if err != nil {
+		if err == errChunked {
+			return lr.readChunkedElems()
+		}
+		return RedisMessage{}, err
+	}
+	if length == -1 {
+		return m, errOldNull
+	}
+	return lr.readChildren(length)
+}
+
+func (lr *limitedReader) readMap() (m RedisMessage, err error) {
+	length, err := lr.readI()
+	if err != nil {
+		if err == errChunked {
+			return lr.readChunkedElems()
+		}
+		return RedisMessage{}, err
+	}
+	return lr.readChildren(length * 2)
+}
+
+func (lr *limitedReader) readChildren(length int64) (m RedisMessage, err error) {
+	lr.enterDepth()
+	defer lr.leaveDepth()
+
+	lr.reserveElements(length)
+
+	if lr.exceeded != nil {
+		if err = lr.drainChildren(length); err != nil {
+			return RedisMessage{}, err
+		}
+		return RedisMessage{}, lr.exceeded
+	}
+
+	msgs := make([]RedisMessage, length)
+	for n := int64(0); n < length; n++ {
+		if msgs[n], err = lr.readNext(); err != nil {
+			if isMessageLimitErr(err) {
+				if err = lr.drainChildren(length - n - 1); err != nil {
+					return RedisMessage{}, err
+				}
+				return RedisMessage{}, lr.exceeded
+			}
+			return RedisMessage{}, err
+		}
+	}
+	m.array = unsafe.SliceData(msgs)
+	m.intlen = length
+	return m, nil
+}
+
+func (lr *limitedReader) drainChildren(n int64) (err error) {
+	for ; n > 0; n-- {
+		if _, err = lr.readNext(); err != nil {
+			if isMessageLimitErr(err) {
+				err = nil
+				continue
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func (lr *limitedReader) readChunkedElems() (m RedisMessage, err error) {
+	lr.enterDepth()
+	defer lr.leaveDepth()
+
+	v := make([]RedisMessage, 0)
+	for {
+		n, e := lr.readNext()
+		if n.typ == typeEnd {
+			if lr.exceeded != nil {
+				return RedisMessage{}, lr.exceeded
+			}
+			m.array = unsafe.SliceData(v)
+			m.intlen = int64(len(v))
+			return m, nil
+		}
+		if e != nil {
+			if !isMessageLimitErr(e) {
+				return RedisMessage{}, e
+			}
+			continue
+		}
+		v = append(v, n)
+	}
+}
+
+func isMessageLimitErr(err error) bool {
+	return errors.Is(err, ErrMessageSizeExceeded) ||
+		errors.Is(err, ErrMessageElementsExceeded) ||
+		errors.Is(err, ErrMessageDepthExceeded)
 }
 
 var lrs = sync.Pool{New: func() any { return &io.LimitedReader{} }}

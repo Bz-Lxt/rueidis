@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	crand "crypto/rand"
+	"errors"
 	"io"
 	"math/rand"
 	"reflect"
@@ -699,4 +700,176 @@ func randN(n int) (v int) {
 		v = rand.Intn(n)
 	}
 	return
+}
+
+func newLimitedReader(t *testing.T, s string, maxBytes, maxElems int64, maxDepth int) *limitedReader {
+	t.Helper()
+	return &limitedReader{
+		i: bufio.NewReader(strings.NewReader(s)),
+		l: readLimit{maxBytes: maxBytes, maxElems: maxElems, maxDepth: maxDepth},
+	}
+}
+
+func TestLimitedReaderSizeExceeded(t *testing.T) {
+	t.Run("blob string", func(t *testing.T) {
+		// "$5\r\nhello\r\n+x\r\n"
+		lr := newLimitedReader(t, "$5\r\nhello\r\n+x\r\n", 4, 0, 0)
+		if _, err := lr.readNext(); !errors.Is(err, ErrMessageSizeExceeded) {
+			t.Fatalf("expected ErrMessageSizeExceeded, got %v", err)
+		}
+		lr.reset(lr.i, lr.l)
+		m, err := lr.readNext()
+		if err != nil {
+			t.Fatalf("unexpected error %v", err)
+		}
+		if m.string() != "x" {
+			t.Fatalf("unexpected message %q", m.string())
+		}
+	})
+
+	t.Run("simple string", func(t *testing.T) {
+		lr := newLimitedReader(t, "+abcdef\r\n", 5, 0, 0)
+		if _, err := lr.readNext(); !errors.Is(err, ErrMessageSizeExceeded) {
+			t.Fatalf("expected ErrMessageSizeExceeded, got %v", err)
+		}
+	})
+
+	t.Run("within limit", func(t *testing.T) {
+		lr := newLimitedReader(t, "$3\r\nabc\r\n", 100, 0, 0)
+		m, err := lr.readNext()
+		if err != nil {
+			t.Fatalf("unexpected error %v", err)
+		}
+		if m.string() != "abc" {
+			t.Fatalf("unexpected message %q", m.string())
+		}
+	})
+
+	t.Run("resp2 null", func(t *testing.T) {
+		lr := newLimitedReader(t, "$-1\r\n+tail\r\n", 100, 0, 0)
+		m, err := lr.readNext()
+		if err != nil {
+			t.Fatalf("unexpected error %v", err)
+		}
+		if m.typ != typeNull {
+			t.Fatalf("expected null, got %q", m.typ)
+		}
+		lr.reset(lr.i, lr.l)
+		if _, err := lr.readNext(); err != nil {
+			t.Fatalf("tail should be readable, got %v", err)
+		}
+	})
+}
+
+func TestLimitedReaderElementsExceeded(t *testing.T) {
+	t.Run("declared length", func(t *testing.T) {
+		// an array of 10 null elements, limit 5
+		var sb strings.Builder
+		sb.WriteString("*10\r\n")
+		for range 10 {
+			sb.WriteString("_\r\n")
+		}
+		sb.WriteString("+tail\r\n")
+		lr := newLimitedReader(t, sb.String(), 0, 5, 0)
+		if _, err := lr.readNext(); !errors.Is(err, ErrMessageElementsExceeded) {
+			t.Fatalf("expected ErrMessageElementsExceeded, got %v", err)
+		}
+		lr.reset(lr.i, lr.l)
+		m, err := lr.readNext()
+		if err != nil {
+			t.Fatalf("unexpected error %v", err)
+		}
+		if m.string() != "tail" {
+			t.Fatalf("unexpected message %q", m.string())
+		}
+	})
+
+	t.Run("cumulative nested", func(t *testing.T) {
+		// "*2\r\n:1\r\n*2\r\n:2\r\n:3\r\n" has 5 elements
+		lr := newLimitedReader(t, "*2\r\n:1\r\n*2\r\n:2\r\n:3\r\n+tail\r\n", 0, 4, 0)
+		if _, err := lr.readNext(); !errors.Is(err, ErrMessageElementsExceeded) {
+			t.Fatalf("expected ErrMessageElementsExceeded, got %v", err)
+		}
+		lr.reset(lr.i, lr.l)
+		if _, err := lr.readNext(); err != nil {
+			t.Fatalf("tail should be readable, got %v", err)
+		}
+	})
+
+	t.Run("exact count within limit", func(t *testing.T) {
+		lr := newLimitedReader(t, "*2\r\n:1\r\n*2\r\n:2\r\n:3\r\n", 0, 5, 0)
+		m, err := lr.readNext()
+		if err != nil {
+			t.Fatalf("unexpected error %v", err)
+		}
+		if m.intlen != 2 {
+			t.Fatalf("unexpected array length %d", m.intlen)
+		}
+	})
+}
+
+func TestLimitedReaderDepthExceeded(t *testing.T) {
+	// "*1\r\n*1\r\n:1\r\n" nests 2 levels
+	t.Run("exceeded", func(t *testing.T) {
+		lr := newLimitedReader(t, "*1\r\n*1\r\n:1\r\n+tail\r\n", 0, 0, 1)
+		if _, err := lr.readNext(); !errors.Is(err, ErrMessageDepthExceeded) {
+			t.Fatalf("expected ErrMessageDepthExceeded, got %v", err)
+		}
+		lr.reset(lr.i, lr.l)
+		if _, err := lr.readNext(); err != nil {
+			t.Fatalf("tail should be readable, got %v", err)
+		}
+	})
+
+	t.Run("within limit", func(t *testing.T) {
+		lr := newLimitedReader(t, "*1\r\n*1\r\n:1\r\n", 0, 0, 2)
+		if _, err := lr.readNext(); err != nil {
+			t.Fatalf("unexpected error %v", err)
+		}
+	})
+}
+
+func TestLimitedReaderChunked(t *testing.T) {
+	t.Run("chunked blob", func(t *testing.T) {
+		s := "$?\r\n;3\r\nabc\r\n;3\r\ndef\r\n;0\r\n+tail\r\n"
+		lr := newLimitedReader(t, s, 10, 0, 0)
+		if _, err := lr.readNext(); !errors.Is(err, ErrMessageSizeExceeded) {
+			t.Fatalf("expected ErrMessageSizeExceeded, got %v", err)
+		}
+		lr.reset(lr.i, lr.l)
+		if _, err := lr.readNext(); err != nil {
+			t.Fatalf("tail should be readable, got %v", err)
+		}
+	})
+
+	t.Run("chunked array", func(t *testing.T) {
+		s := "*?\r\n:1\r\n:2\r\n.\r\n+tail\r\n"
+		lr := newLimitedReader(t, s, 0, 2, 0)
+		if _, err := lr.readNext(); !errors.Is(err, ErrMessageElementsExceeded) {
+			t.Fatalf("expected ErrMessageElementsExceeded, got %v", err)
+		}
+		lr.reset(lr.i, lr.l)
+		if _, err := lr.readNext(); err != nil {
+			t.Fatalf("tail should be readable, got %v", err)
+		}
+
+		lr2 := newLimitedReader(t, "*?\r\n:1\r\n:2\r\n.\r\n", 0, 3, 0)
+		m, err := lr2.readNext()
+		if err != nil {
+			t.Fatalf("unexpected error %v", err)
+		}
+		if m.intlen != 2 {
+			t.Fatalf("unexpected array length %d", m.intlen)
+		}
+	})
+}
+
+func TestLimitedReaderMap(t *testing.T) {
+	// "%1\r\n+a\r\n:1\r\n" has 3 elements at depth 1
+	lr := newLimitedReader(t, "%1\r\n+a\r\n:1\r\n", 0, 3, 1)
+	if m, err := lr.readNext(); err != nil {
+		t.Fatalf("unexpected error %v", err)
+	} else if m.intlen != 2 {
+		t.Fatalf("unexpected map length %d", m.intlen)
+	}
 }

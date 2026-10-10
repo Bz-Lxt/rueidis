@@ -7313,3 +7313,317 @@ func TestDisableCacheStaticClientTTLDoCache(t *testing.T) {
 		t.Fatalf("got %q / %v", got, err)
 	}
 }
+
+func TestPipeMessageSizeLimit(t *testing.T) {
+	defer ShouldNotLeak(SetupLeakDetection())
+
+	run := func(t *testing.T, bg bool) {
+		p, mock, _, shutdown := setup(t, ClientOption{MaxMessageSize: 256})
+		defer shutdown()
+		if bg {
+			p.background()
+		}
+
+		go func() {
+			mock.Expect("GET", "k").ReplyBlobString(strings.Repeat("x", 1000))
+			mock.Expect("GET", "k2").ReplyString("v2")
+		}()
+
+		r := p.Do(context.Background(), cmds.NewCompleted([]string{"GET", "k"}))
+		if !errors.Is(r.Error(), ErrMessageSizeExceeded) {
+			t.Fatalf("expected ErrMessageSizeExceeded, got %v", r.Error())
+		}
+		if p.Error() != nil {
+			t.Fatalf("pipe should stay healthy, got %v", p.Error())
+		}
+
+		r = p.Do(context.Background(), cmds.NewCompleted([]string{"GET", "k2"}))
+		if v, err := r.ToString(); err != nil || v != "v2" {
+			t.Fatalf("connection should be reusable, got %q / %v", v, err)
+		}
+	}
+
+	t.Run("sync", func(t *testing.T) { run(t, false) })
+	t.Run("pipelined", func(t *testing.T) { run(t, true) })
+}
+
+func TestPipeMessageElementsLimit(t *testing.T) {
+	defer ShouldNotLeak(SetupLeakDetection())
+	p, mock, _, shutdown := setup(t, ClientOption{MaxMessageElements: 10})
+	defer shutdown()
+	p.background()
+
+	go func() {
+		v := make([]RedisMessage, 1000)
+		for i := range v {
+			v[i] = RedisMessage{typ: typeNull}
+		}
+		mock.Expect("LRANGE", "k").Reply(slicemsg('*', v))
+		mock.Expect("GET", "k2").ReplyString("v2")
+	}()
+
+	r := p.Do(context.Background(), cmds.NewCompleted([]string{"LRANGE", "k"}))
+	if !errors.Is(r.Error(), ErrMessageElementsExceeded) {
+		t.Fatalf("expected ErrMessageElementsExceeded, got %v", r.Error())
+	}
+	if p.Error() != nil {
+		t.Fatalf("pipe should stay healthy, got %v", p.Error())
+	}
+
+	r = p.Do(context.Background(), cmds.NewCompleted([]string{"GET", "k2"}))
+	if v, err := r.ToString(); err != nil || v != "v2" {
+		t.Fatalf("connection should be reusable, got %q / %v", v, err)
+	}
+}
+
+func TestPipeMessageDepthLimit(t *testing.T) {
+	defer ShouldNotLeak(SetupLeakDetection())
+	p, mock, _, shutdown := setup(t, ClientOption{MaxMessageDepth: 2})
+	defer shutdown()
+	p.background()
+
+	nested := slicemsg('*', []RedisMessage{
+		slicemsg('*', []RedisMessage{
+			slicemsg('*', []RedisMessage{{typ: ':', intlen: 1}}),
+		}),
+	})
+
+	go func() {
+		mock.Expect("GET", "k").Reply(nested)
+		mock.Expect("GET", "k2").ReplyString("v2")
+	}()
+
+	r := p.Do(context.Background(), cmds.NewCompleted([]string{"GET", "k"}))
+	if !errors.Is(r.Error(), ErrMessageDepthExceeded) {
+		t.Fatalf("expected ErrMessageDepthExceeded, got %v", r.Error())
+	}
+	if p.Error() != nil {
+		t.Fatalf("pipe should stay healthy, got %v", p.Error())
+	}
+
+	r = p.Do(context.Background(), cmds.NewCompleted([]string{"GET", "k2"}))
+	if v, err := r.ToString(); err != nil || v != "v2" {
+		t.Fatalf("connection should be reusable, got %q / %v", v, err)
+	}
+}
+
+func TestPipeMessageLimitReleasesWaiter(t *testing.T) {
+	defer ShouldNotLeak(SetupLeakDetection())
+	p, mock, _, shutdown := setup(t, ClientOption{MaxMessageSize: 256})
+	defer shutdown()
+	p.background()
+
+	headerWritten := make(chan struct{})
+	release := make(chan struct{})
+
+	go func() {
+		mock.Expect("GET", "k")
+		_, _ = mock.conn.Write([]byte("$1000\r\n"))
+		close(headerWritten)
+		<-release
+		_, _ = mock.conn.Write([]byte(strings.Repeat("x", 1000) + "\r\n"))
+		mock.Expect("GET", "k2").ReplyString("v2")
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- p.Do(ctx, cmds.NewCompleted([]string{"GET", "k"})).Error()
+	}()
+
+	<-headerWritten
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != context.Canceled {
+			t.Fatalf("expected context.Canceled, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter was not released after context cancellation")
+	}
+
+	close(release)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && p.loadWaits() != 0 {
+		time.Sleep(time.Millisecond * 10)
+	}
+	if p.loadWaits() != 0 {
+		t.Fatalf("pending waiter not settled, waits=%d", p.loadWaits())
+	}
+
+	r := p.Do(context.Background(), cmds.NewCompleted([]string{"GET", "k2"}))
+	if v, err := r.ToString(); err != nil || v != "v2" {
+		t.Fatalf("connection should be reusable, got %q / %v", v, err)
+	}
+}
+
+func TestPipeMessageLimitCache(t *testing.T) {
+	defer ShouldNotLeak(SetupLeakDetection())
+	p, mock, _, shutdown := setup(t, ClientOption{MaxMessageSize: 256})
+	defer shutdown()
+	p.background()
+
+	commandsFlown := make(chan struct{})
+	proceed := make(chan struct{})
+
+	go func() {
+		// Read and answer the first four commands, then wait so the test can
+		// join the in-flight cache entry before the over-limit EXEC reply.
+		mock.Expect("CLIENT", "CACHING", "YES").ReplyString("OK").
+			Expect("MULTI").ReplyString("OK").
+			Expect("PTTL", "k").ReplyInteger(-1).
+			Expect("GET", "k").ReplyString("QUEUED")
+		close(commandsFlown)
+		<-proceed
+		mock.Expect("EXEC").Reply(slicemsg('*', []RedisMessage{
+			{typ: ':', intlen: -1},
+			strmsg('$', strings.Repeat("x", 1000)),
+		}))
+		mock.Expect("CLIENT", "CACHING", "YES").ReplyString("OK").
+			Expect("MULTI").ReplyString("OK").
+			Expect("PTTL", "k").ReplyInteger(-1).
+			Expect("GET", "k").ReplyString("QUEUED").
+			Expect("EXEC").Reply(slicemsg('*', []RedisMessage{
+				{typ: ':', intlen: -1},
+				strmsg('+', "fresh"),
+			}))
+	}()
+
+	// The main caller creates the flight and drives the wire round.
+	callerErr := make(chan error, 1)
+	go func() {
+		callerErr <- p.DoCache(context.Background(),
+			Cacheable(cmds.NewCompleted([]string{"GET", "k"})), time.Minute).Error()
+	}()
+
+	<-commandsFlown
+	// A concurrent fetch joins the in-flight entry; Cancel must release it too.
+	_, ce := p.cache.Flight("k", "GET", time.Minute, time.Now())
+	if ce == nil {
+		t.Fatal("expected to join the in-flight cache entry")
+	}
+	waitErr := make(chan error, 1)
+	go func() {
+		_, err := ce.Wait(context.Background())
+		waitErr <- err
+	}()
+
+	close(proceed)
+
+	if err := <-callerErr; !errors.Is(err, ErrMessageSizeExceeded) {
+		t.Fatalf("expected ErrMessageSizeExceeded, got %v", err)
+	}
+	if err := <-waitErr; !errors.Is(err, ErrMessageSizeExceeded) {
+		t.Fatalf("flight waiter should be released with the limit error, got %v", err)
+	}
+
+	// the canceled entry must not be cached: the next fetch reaches the server again
+	r := p.DoCache(context.Background(),
+		Cacheable(cmds.NewCompleted([]string{"GET", "k"})), time.Minute)
+	if v, err := r.ToString(); err != nil || v != "fresh" {
+		t.Fatalf("expected a fresh reply, got %q / %v", v, err)
+	}
+}
+
+func TestPipeMessageLimitPubSub(t *testing.T) {
+	defer ShouldNotLeak(SetupLeakDetection())
+	p, mock, _, shutdown := setup(t, ClientOption{MaxMessageSize: 256})
+	defer shutdown()
+
+	builder := cmds.NewBuilder(cmds.NoSlot)
+	activate := builder.Subscribe().Channel("c").Build()
+	deactivate := builder.Unsubscribe().Channel("c").Build()
+
+	got := make(chan PubSubMessage, 16)
+
+	go func() {
+		mock.Expect(activate.Commands()...).Reply(slicemsg('>', []RedisMessage{
+			strmsg('+', "subscribe"),
+			strmsg('+', "c"),
+			{typ: ':', intlen: 1},
+		}))
+		mock.Expect().Reply(slicemsg('>', []RedisMessage{
+			strmsg('+', "message"),
+			strmsg('+', "c"),
+			strmsg('$', strings.Repeat("z", 1000)),
+		}))
+		mock.Expect().Reply(slicemsg('>', []RedisMessage{
+			strmsg('+', "message"),
+			strmsg('+', "c"),
+			strmsg('+', "ok"),
+		}))
+		mock.Expect(deactivate.Commands()...).Expect(cmds.PingCmd.Commands()...).Reply(slicemsg('>', []RedisMessage{
+			strmsg('+', "unsubscribe"),
+			strmsg('+', "c"),
+			{typ: ':', intlen: 0},
+		})).Reply(strmsg('+', "PONG"))
+	}()
+
+	if err := p.Receive(context.Background(), activate, func(m PubSubMessage) {
+		got <- m
+		if m.Message == "ok" {
+			if err := p.Do(context.Background(), deactivate).Error(); err != nil {
+				t.Errorf("unexpected err %v", err)
+			}
+		}
+	}); err != nil {
+		t.Fatalf("unexpected err %v", err)
+	}
+
+	close(got)
+	n := 0
+	for m := range got {
+		if m.Channel != "c" || m.Message != "ok" {
+			t.Fatalf("over-limit message must not be delivered, got %v", m)
+		}
+		n++
+	}
+	if n != 1 {
+		t.Fatalf("expected exactly one delivered message, got %d", n)
+	}
+}
+
+func TestPipeMessageLimitPubSubHooks(t *testing.T) {
+	defer ShouldNotLeak(SetupLeakDetection())
+	p, mock, _, shutdown := setup(t, ClientOption{MaxMessageSize: 256})
+	defer shutdown()
+
+	builder := cmds.NewBuilder(cmds.NoSlot)
+	got := make(chan PubSubMessage, 16)
+	hookErrCh := p.SetPubSubHooks(PubSubHooks{OnMessage: func(m PubSubMessage) { got <- m }})
+
+	activate := builder.Subscribe().Channel("c").Build()
+	go func() {
+		mock.Expect(activate.Commands()...).Reply(slicemsg('>', []RedisMessage{
+			strmsg('+', "subscribe"),
+			strmsg('+', "c"),
+			{typ: ':', intlen: 1},
+		}))
+		mock.Expect().Reply(slicemsg('>', []RedisMessage{
+			strmsg('+', "message"),
+			strmsg('+', "c"),
+			strmsg('$', strings.Repeat("z", 1000)),
+		}))
+		mock.Expect().Reply(slicemsg('>', []RedisMessage{
+			strmsg('+', "message"),
+			strmsg('+', "c"),
+			strmsg('+', "ok"),
+		}))
+	}()
+
+	if err := p.Do(context.Background(), activate).Error(); err != nil {
+		t.Fatalf("subscribe failed: %v", err)
+	}
+
+	select {
+	case m := <-got:
+		if m.Channel != "c" || m.Message != "ok" {
+			t.Fatalf("over-limit message must not be delivered, got %v", m)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected the normal message after the dropped over-limit one")
+	}
+	_ = hookErrCh
+}

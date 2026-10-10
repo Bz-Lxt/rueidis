@@ -1763,3 +1763,19 @@ func BenchmarkSingleClient_DoCache(b *testing.B) {
 	})
 	client.Close()
 }
+
+func TestOverLimitErrorsNotRetryable(t *testing.T) {
+	c := &singleClient{}
+	w := &mockWire{ErrorFn: func() error { return nil }}
+	for _, e := range []error{ErrMessageSizeExceeded, ErrMessageElementsExceeded, ErrMessageDepthExceeded} {
+		if c.isRetryable(e, context.Background()) {
+			t.Errorf("%v should not be retryable", e)
+		}
+		if isRetryable(e, w, context.Background()) {
+			t.Errorf("%v should not be retryable", e)
+		}
+		if !isMessageLimitErr(e) {
+			t.Errorf("%v should be identifiable as a limit error", e)
+		}
+	}
+}

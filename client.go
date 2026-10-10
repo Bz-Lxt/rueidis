@@ -387,6 +387,9 @@ func (c *singleClient) isRetryable(err error, ctx context.Context) bool {
 	if err == nil || err == Nil || err == ErrDoCacheAborted || atomic.LoadUint32(&c.stop) != 0 || ctx.Err() != nil {
 		return false
 	}
+	if isMessageLimitErr(err) { // over-limit replies are deterministic: do not retry
+		return false
+	}
 	if err, ok := err.(*RedisError); ok {
 		return err.IsLoading()
 	}
@@ -395,6 +398,9 @@ func (c *singleClient) isRetryable(err error, ctx context.Context) bool {
 
 func isRetryable(err error, w wire, ctx context.Context) bool {
 	if err == nil || err == Nil || w.Error() != nil || ctx.Err() != nil {
+		return false
+	}
+	if isMessageLimitErr(err) { // over-limit replies are deterministic: do not retry
 		return false
 	}
 	if err, ok := err.(*RedisError); ok {

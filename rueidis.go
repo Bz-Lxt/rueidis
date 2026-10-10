@@ -89,6 +89,16 @@ var (
 	ErrWrongPipelineMultiplex = errors.New("ClientOption.PipelineMultiplex must not be bigger than MaxPipelineMultiplex")
 	// ErrDedicatedClientRecycled means the caller attempted to use the dedicated client which has been already recycled (after canceled/closed).
 	ErrDedicatedClientRecycled = errors.New("dedicated client should not be used after recycled")
+
+	// ErrMessageSizeExceeded means a redis message has exceeded the ClientOption.MaxMessageSize limit.
+	// The error is not retried, and the connection is still usable after the full message is consumed.
+	ErrMessageSizeExceeded = errors.New("redis message size exceeded the ClientOption.MaxMessageSize")
+	// ErrMessageElementsExceeded means a redis message has exceeded the ClientOption.MaxMessageElements limit.
+	// The error is not retried, and the connection is still usable after the full message is consumed.
+	ErrMessageElementsExceeded = errors.New("redis message element count exceeded the ClientOption.MaxMessageElements")
+	// ErrMessageDepthExceeded means a redis message has exceeded the ClientOption.MaxMessageDepth limit.
+	// The error is not retried, and the connection is still usable after the full message is consumed.
+	ErrMessageDepthExceeded = errors.New("redis message nesting depth exceeded the ClientOption.MaxMessageDepth")
 	// DisableClientSetInfo is the value that can be used for ClientOption.ClientSetInfo to disable making the CLIENT SETINFO command
 	DisableClientSetInfo = make([]string, 0)
 )
@@ -285,6 +295,24 @@ type ClientOption struct {
 	// AZFromInfo forces the `availability_zone` field to be taken from an INFO command instead of HELLO.
 	// Primarily used for AWS MemoryDB.
 	AZFromInfo bool
+
+	// MaxMessageSize limits the maximum size in bytes of a single redis message.
+	// If a message exceeds this limit, the corresponding command returns ErrMessageSizeExceeded.
+	// The full message is still consumed, so that the connection can keep processing the following replies.
+	// Zero (default) disables the limit.
+	MaxMessageSize int
+
+	// MaxMessageElements limits the total number of elements (including all nested ones) of a single redis message.
+	// If a message exceeds this limit, the corresponding command returns ErrMessageElementsExceeded.
+	// The full message is still consumed, so that the connection can keep processing the following replies.
+	// Zero (default) disables the limit.
+	MaxMessageElements int
+
+	// MaxMessageDepth limits the maximum nesting depth of aggregates (arrays, maps and sets) of a single redis message.
+	// If a message exceeds this limit, the corresponding command returns ErrMessageDepthExceeded.
+	// The full message is still consumed, so that the connection can keep processing the following replies.
+	// Zero (default) disables the limit.
+	MaxMessageDepth int
 }
 
 // SentinelOption contains MasterSet,

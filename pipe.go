@@ -97,6 +97,9 @@ type pipe struct {
 	r2ps            bool // identify this pipe is used for resp2 pubsub or not
 	noNoDelay       bool
 	optIn           bool
+
+	limits readLimit     // per-message byte, element and depth limits; zero disables
+	scan   limitedReader // reused per read; reads are serialized in the read goroutine
 }
 
 type pipeFn func(ctx context.Context, connFn func(ctx context.Context) (net.Conn, error), option *ClientOption) (p *pipe, err error)
@@ -126,6 +129,11 @@ func _newPipe(ctx context.Context, connFn func(context.Context) (net.Conn, error
 
 		r2ps:  r2ps,
 		optIn: isOptIn(option.ClientTrackingOptions),
+	}
+	p.limits = readLimit{
+		maxBytes: int64(option.MaxMessageSize),
+		maxElems: int64(option.MaxMessageElements),
+		maxDepth: option.MaxMessageDepth,
 	}
 	if !nobg {
 		switch queueTypeFromEnv {
@@ -555,6 +563,16 @@ func (p *pipe) _backgroundWrite() (err error) {
 	return
 }
 
+// readMessage reads one complete redis message. It uses the limited reader when
+// per-message limits are configured; otherwise, it uses the normal fast path.
+func (p *pipe) readMessage() (RedisMessage, error) {
+	if p.limits.enabled() {
+		p.scan.reset(p.r, p.limits)
+		return p.scan.readNext()
+	}
+	return readNextMessage(p.r)
+}
+
 func (p *pipe) _backgroundRead() (err error) {
 	var (
 		msg   RedisMessage
@@ -588,8 +606,43 @@ func (p *pipe) _backgroundRead() (err error) {
 	}()
 
 	for {
-		if msg, err = readNextMessage(p.r); err != nil {
-			return
+		if msg, err = p.readMessage(); err != nil {
+			if !isMessageLimitErr(err) {
+				return
+			}
+			if msg.typ == typePush || r2ps {
+				// An over-limit RESP3 push or RESP2 pubsub message is fully drained
+				// already and must never be delivered to subscribers or hooks.
+				err = nil
+				continue
+			}
+			// Over-limit command reply: the full message is drained already, so the
+			// connection stays usable. Fulfill the current command slot with the
+			// identifiable error instead of tearing down the connection.
+			lerr := err
+			err = nil
+			if ff == len(multi) {
+				ff = 0
+				ones[0], multi, ch, resps = p.queue.NextResultCh()
+				if ch == nil { // ch should not be nil; otherwise, it must be a protocol bug
+					p.queue.FinishResult()
+					panic(protocolbug)
+				}
+				if multi == nil {
+					multi = ones
+				}
+			}
+			p.cancelCacheReply(multi, ff, lerr)
+			resp := NewErrorResult(lerr)
+			if resps != nil {
+				resps[ff] = resp
+			}
+			if ff++; ff == len(multi) {
+				ch <- resp
+				p.queue.FinishResult()
+			}
+			msg = RedisMessage{}
+			continue
 		}
 		if msg.typ == '>' || (r2ps && len(msg.values()) != 0 && msg.values()[0].string() != "pong") {
 			if prply, unsub = p.handlePush(msg.values()); !prply {
@@ -618,7 +671,9 @@ func (p *pipe) _backgroundRead() (err error) {
 				}
 			}
 			for ; i < len(msg.values()); i++ {
-				if msg.values()[i], err = readNextMessage(p.r); err != nil {
+				// An over-limit interspersed reply is fully drained but cannot be
+				// patched into the response, so the command itself fails.
+				if msg.values()[i], err = p.readMessage(); err != nil {
 					return
 				}
 			}
@@ -1443,6 +1498,36 @@ func (p *pipe) DoMultiStream(ctx context.Context, pool *pool, multi ...Completed
 	return NewErrorResultStream(p.Error())
 }
 
+// cancelCacheReply cancels the client-side-cache flight (and releases its waiters)
+// that the over-limit reply at slot ff would have resolved, ensuring that no
+// invalid data is left in the cache.
+func (p *pipe) cancelCacheReply(multi []Completed, ff int, err error) {
+	if p.cache == nil {
+		return
+	}
+	if ff > 0 && cmds.IsStaticTTL(multi[ff]) {
+		ck, cc := cmds.CacheKey(Cacheable(multi[ff]))
+		p.cache.Cancel(ck, cc, err)
+		return
+	}
+	if ff >= 4 && multi[0].IsOptIn() {
+		if cacheable := Cacheable(multi[ff-1]); cacheable.IsMGet() {
+			cc := cmds.MGetCacheCmd(cacheable)
+			commands := cacheable.Commands()
+			keys := len(commands) - 1
+			if cc[0] == 'J' { // the last argument of JSON.MGET is a path, not a key
+				keys--
+			}
+			for i := 1; i <= keys; i++ {
+				p.cache.Cancel(commands[i], cc, err)
+			}
+		} else {
+			ck, cc := cmds.CacheKey(Cacheable(multi[ff-1]))
+			p.cache.Cancel(ck, cc, err)
+		}
+	}
+}
+
 func (p *pipe) syncDo(dl time.Time, dlOk bool, cmd Completed) (resp RedisResult) {
 	if dlOk {
 		if p.timeout > 0 && !cmd.IsBlock() {
@@ -1462,9 +1547,13 @@ func (p *pipe) syncDo(dl time.Time, dlOk bool, cmd Completed) (resp RedisResult)
 	var msg RedisMessage
 	err := flushCmd(p.w, cmd.Commands())
 	if err == nil {
-		msg, err = syncRead(p.r)
+		msg, err = syncRead(p)
 	}
 	if err != nil {
+		if isMessageLimitErr(err) {
+			// The full over-limit message is consumed already; keep the connection.
+			return NewErrorResult(err)
+		}
 		if dlOk && errors.Is(err, os.ErrDeadlineExceeded) {
 			err = context.DeadlineExceeded
 		}
@@ -1512,7 +1601,15 @@ process:
 		goto abort
 	}
 	for i := range resp {
-		if msg, err = syncRead(p.r); err != nil {
+		if msg, err = syncRead(p); err != nil {
+			if isMessageLimitErr(err) {
+				// The full over-limit message is consumed; keep the connection and
+				// fail this reply and every remaining one without closing it.
+				for ; i < len(resp); i++ {
+					resp[i] = NewErrorResult(err)
+				}
+				return
+			}
 			goto abort
 		}
 		resp[i] = NewResult(msg, err)
@@ -1530,15 +1627,13 @@ abort:
 	}
 }
 
-func syncRead(r *bufio.Reader) (m RedisMessage, err error) {
-next:
-	if m, err = readNextMessage(r); err != nil {
+func syncRead(p *pipe) (m RedisMessage, err error) {
+	for {
+		if m, err = p.readMessage(); m.typ == typePush {
+			continue // pushes (including over-limit, fully drained ones) are skipped
+		}
 		return m, err
 	}
-	if m.typ == '>' {
-		goto next
-	}
-	return m, nil
 }
 
 func (p *pipe) optInCmd() cmds.Completed {
